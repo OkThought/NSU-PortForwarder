@@ -15,16 +15,16 @@ public class PortForwarder {
 
                 "Description\n\n\t" +
 
-                "A port forwarder is a program which lives between client \n" +
-                "connecting to some internet service and the service itself.\n" +
-                "It takes incoming bytes on from local tcp connection and\n" +
-                "forwards them to the requested service connection pretending\n" +
+                "A port forwarder is a program which lives between client\n\t" +
+                "connecting to some internet service and the service itself.\n\t" +
+                "It takes incoming bytes on from local tcp connection and\n\t" +
+                "forwards them to the requested service connection pretending\n\t" +
                 "the client\n\n" +
 
                 "Arguments\n\n\t" +
 
-                "lport - the port on which the forwarder works.\n" +
-                "It is a port which the client passes to address line \n" +
+                "lport - the port on which the forwarder works.\n\t" +
+                "It is a port which the client passes to address line \n\t" +
                 "(e.g. 'http://google.com:12345', the lport is 12345)\n\n\t" +
 
                 "rhost and rport together describe the requested service.\n\n");
