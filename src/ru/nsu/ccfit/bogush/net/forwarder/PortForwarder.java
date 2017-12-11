@@ -1,6 +1,6 @@
 package ru.nsu.ccfit.bogush.net.forwarder;
 
-import java.io.IOException;
+import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
@@ -95,6 +95,7 @@ public class PortForwarder {
     private final ServerSocketChannel serverSocketChannel;
     private final InetSocketAddress localSocketAddress;
     private final InetSocketAddress remoteSocketAddress;
+    private final String rhost;
     private static final int BUFF_SIZE = 1 << 20; // 1 megabyte
 
     private PortForwarder(int lport, InetAddress rhost, int rport) throws IOException {
@@ -107,6 +108,7 @@ public class PortForwarder {
         serverSocketChannel = ServerSocketChannel.open();
         localSocketAddress = new InetSocketAddress(lport);
         remoteSocketAddress = new InetSocketAddress(rhost, rport);
+        this.rhost = rhost.getHostName();
 
         System.out.format("Configured Port Forwarder\n\t" +
                 "local: %s\n\tremote: %s\n\n", localSocketAddress, remoteSocketAddress);
@@ -130,10 +132,61 @@ public class PortForwarder {
             return;
         }
 
+        /*
+         * after we've prepared our  port forwarder  to start
+         * add line '127.0.0.1 <rhost>' to /etc/hosts to  let
+         * the client start using the forwarder without doing
+         * that ^ himself.
+         */
+        addHostEntry();
+
         try {
             loop();
         } catch (IOException e) {
             System.err.println("Loop failed :(");
+            e.printStackTrace();
+        }
+    }
+
+    private boolean hostEntryAdded = false;
+    private String hostEntry = null;
+    private void addHostEntry() {
+        hostEntry = "127.0.0.1 " + rhost;
+        try (FileWriter fileWriter = new FileWriter("/etc/hosts", true)) {
+            BufferedWriter writer = new BufferedWriter(fileWriter);
+            writer.write(hostEntry);
+            hostEntryAdded = true;
+        } catch (IOException e) {
+            System.err.format("Warning: Couldn't add host entry '%s': %s\n", hostEntry, e.getMessage());
+            System.err.println("If this was due to lack of permissions you may rerun Port Forwarder\n" +
+                    "as a super user (e.g. using sudo command, see man page sudo(1)).");
+            System.err.println("Or you can do it manually before actually using Port Forwarder");
+            return;
+        }
+
+        Runtime.getRuntime().addShutdownHook(new Thread(this::removeHostEntry, "HostEntryRemover"));
+    }
+
+    private void removeHostEntry() {
+        if (!hostEntryAdded) return;
+
+        try (FileWriter fileWriter = new FileWriter("/etc/hosts", false)) {
+            BufferedReader reader = new BufferedReader(new FileReader("/etc/hosts"));
+            BufferedWriter writer = new BufferedWriter(fileWriter);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.trim().equals(hostEntry)) {
+                    hostEntryAdded = false;
+                    continue;
+                }
+                writer.write(line);
+            }
+
+            if (hostEntryAdded) {
+                System.err.format("Couldn't find and remove host entry '%s': was it you?!\n", hostEntry);
+            }
+
+        } catch (IOException e) {
             e.printStackTrace();
         }
     }
