@@ -1,10 +1,10 @@
 package ru.nsu.ccfit.bogush.net.forwarder;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.*;
-import java.util.ArrayList;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.util.Iterator;
 
 public class PortForwarder {
     private static void usage() {
@@ -88,104 +88,185 @@ public class PortForwarder {
             System.exit(EXIT_FAILURE);
         }
 
-        portForwarder.loop();
+        portForwarder.start();
     }
 
-    private final ServerSocket serverSocket;
+    private final Selector selector;
+    private final ServerSocketChannel serverSocketChannel;
+    private final InetSocketAddress localSocketAddress;
     private final InetSocketAddress remoteSocketAddress;
-    private final ArrayList<Connection> connections;
-    private static final int BUFF_SIZE = 1024;
-    private final byte[] buffer = new byte[BUFF_SIZE];
+    private static final int BUFF_SIZE = 1 << 20; // 1 megabyte
 
     private PortForwarder(int lport, InetAddress rhost, int rport) throws IOException {
-        serverSocket = new ServerSocket(lport);
+        System.out.format("Configure Port Forwarder with params:\n\t" +
+                "lport: %s\n\t" +
+                "rhost: %s\n\t" +
+                "rport: %s\n\n", lport, rhost, rport);
+
+        selector = Selector.open();
+        serverSocketChannel = ServerSocketChannel.open();
+        localSocketAddress = new InetSocketAddress(lport);
         remoteSocketAddress = new InetSocketAddress(rhost, rport);
-        connections = new ArrayList<>();
+
+        System.out.format("Configured Port Forwarder\n\t" +
+                "local: %s\n\tremote: %s\n\n", localSocketAddress, remoteSocketAddress);
+
+        if (remoteSocketAddress.isUnresolved()) {
+            System.err.println("Remote socket address is unresolved :(");
+        }
     }
 
-    private void loop() {
-        acceptNewConnection();
-        forwardInputOutput();
-    }
-
-    private void acceptNewConnection() {
-        Connection connection = new Connection();
+    private void start() {
         try {
-            connection.local = serverSocket.accept();
-            connection.localInput = connection.local.getInputStream();
-            connection.localOutput = connection.local.getOutputStream();
-        } catch (SocketTimeoutException e) {
+            System.out.println("Starting Port Forwarder...");
+            serverSocketChannel.configureBlocking(false);
+            serverSocketChannel.bind(localSocketAddress);
+            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT, serverSocketChannel);
+            System.out.format("Started Port Forwarder:\n\t" +
+                    "local: %s\n\tremote: %s\n\n", serverSocketChannel.getLocalAddress(), remoteSocketAddress);
+        } catch (IOException e) {
+            System.err.println("Start failed :(");
+            e.printStackTrace();
             return;
+        }
+
+        try {
+            loop();
+        } catch (IOException e) {
+            System.err.println("Loop failed :(");
+            e.printStackTrace();
+        }
+    }
+
+    private void loop() throws IOException {
+        while (!Thread.interrupted()) {
+            int numberReady = 0;
+            while (numberReady <= 0) {
+                numberReady = selector.select();
+            }
+
+            System.out.println(numberReady + " channels are ready");
+            System.out.println("processing them...\n");
+            int cnt = 0;
+            Iterator<SelectionKey> keyIter = selector.selectedKeys().iterator();
+            while (keyIter.hasNext()) {
+                SelectionKey key = keyIter.next();
+                if (!key.isValid()) {
+                    keyIter.remove();
+                    continue;
+                }
+                try {
+                    System.out.format("%d. %s\n", ++cnt, key.channel());
+
+                    if (key.isAcceptable()) {
+                        System.out.println("\tis acceptable");
+                        acceptNewConnection();
+                        continue;
+                    } else if (key.isConnectable()) {
+                        System.out.println("\tis connectable");
+                        continue;
+                    }
+
+                    if (key.isReadable()) {
+                        System.out.println("\tis readable");
+                        ForwardUnit forwardUnit = (ForwardUnit) key.attachment();
+                        int bytesRead = forwardUnit.read();
+                        if (bytesRead < 0) {
+                            // eof
+                            forwardUnit.in.close();
+                            forwardUnit.out.close();
+                            continue;
+                        }
+                        System.out.format("\tbytes read: %d\n", bytesRead);
+                    }
+
+                    if (key.isWritable()) {
+                        System.out.println("\tis writable");
+                        ForwardUnit forwardUnit = (ForwardUnit) key.attachment();
+                        int bytesWritten = forwardUnit.write();
+                        System.out.format("\tbytes written: %d\n", bytesWritten);
+                    }
+                } finally {
+                    keyIter.remove();
+                }
+
+                System.out.println();
+            }
+        }
+    }
+
+    private void acceptNewConnection() throws IOException {
+        SocketChannel localChannel;
+        try {
+            localChannel = serverSocketChannel.accept();
+            localChannel.configureBlocking(false);
+            System.out.println("\taccepted " + localChannel);
+        } catch (SocketTimeoutException e) {
+            throw e;
         } catch (IOException e) {
             e.printStackTrace();
             // TODO: 12/10/17 correctly handle exception
+            throw e;
         }
 
-        if (connection.local == null) return;
+        SocketChannel remoteChannel = null;
 
         try {
-            connection.remote = new Socket();
-            connection.remote.connect(remoteSocketAddress);
-            connection.remoteInput = connection.remote.getInputStream();
-            connection.remoteOutput = connection.remote.getOutputStream();
+//            System.out.println("\tconnecting it to remote: " + remoteSocketAddress);
+            remoteChannel = SocketChannel.open();
+            remoteChannel.connect(remoteSocketAddress);
+            remoteChannel.configureBlocking(false);
+            System.out.println("\tconnected " + remoteChannel);
         } catch (IOException e) {
             e.printStackTrace();
             try {
-                connection.local.close();
-                if (connection.remote != null) {
-                    connection.remote.close();
+                localChannel.close();
+                if (remoteChannel != null) {
+                    remoteChannel.close();
                 }
             } catch (IOException e1) {
                 e1.printStackTrace();
             }
             // TODO: 12/10/17 correctly handle exception
+            throw e;
         }
 
-        connections.add(connection);
-    }
-
-    private void forwardInputOutput() {
-        int connectionIndex = 0;
-        for (Connection connection : connections) {
-            try {
-                int bytesForwarded;
-                bytesForwarded = forward(connection.remoteInput, connection.localOutput);
-
-                if (bytesForwarded >= 0) {
-                    bytesForwarded = forward(connection.localInput, connection.remoteOutput);
-                }
-
-                if (bytesForwarded < 0) {
-                    // got eof from remote socket
-                    connection.remote.close();
-                    connection.local.close();
-                    connections.remove(connectionIndex);
-                    continue;
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-                // TODO: 12/10/17 correctly handle exception
-            }
-
-            ++connectionIndex;
+        try {
+            ForwardUnit l2r = new ForwardUnit(localChannel, remoteChannel, BUFF_SIZE);
+            ForwardUnit r2l = new ForwardUnit(remoteChannel, localChannel, BUFF_SIZE);
+            localChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, l2r);
+            remoteChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, r2l);
+        } catch (IOException e) {
+            e.printStackTrace();
+            throw e;
+            // TODO: 12/10/17 correctly handle exception
         }
     }
 
-    private int forward(InputStream in, OutputStream out) throws IOException {
-        int available = in.available();
-        int bytesRead = in.read(buffer, 0, Math.min(available, buffer.length));
-        if (bytesRead > 0) {
-            out.write(buffer, 0, bytesRead);
-        }
-        return bytesRead;
-    }
+    private static class ForwardUnit {
+        private final SocketChannel in;
+        private final SocketChannel out;
+        private final ByteBuffer buffer;
+        private boolean lastOperationWasRead = true;
 
-    private static class Connection {
-        private Socket local;
-        private Socket remote;
-        private InputStream localInput;
-        private InputStream remoteInput;
-        private OutputStream localOutput;
-        private OutputStream remoteOutput;
+        private ForwardUnit(SocketChannel in, SocketChannel out, int bufferSize) {
+            this.in = in;
+            this.out = out;
+            this.buffer = ByteBuffer.allocate(bufferSize);
+        }
+
+        private int read() throws IOException {
+            if (!lastOperationWasRead) buffer.compact();
+            int bytesRead = in.read(buffer);
+            lastOperationWasRead = true;
+            return bytesRead;
+        }
+
+        private int write() throws IOException {
+            if (lastOperationWasRead) buffer.flip();
+            int bytesWritten = out.write(buffer);
+            lastOperationWasRead = false;
+            return bytesWritten;
+        }
     }
 }
