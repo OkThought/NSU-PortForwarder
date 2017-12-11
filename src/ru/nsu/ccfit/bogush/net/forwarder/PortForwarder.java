@@ -12,23 +12,23 @@ public class PortForwarder {
         System.out.print(
                 "Usage\n\n\t" +
 
-                "<program_name> lport rhost rport\n\n" +
+                        "<program_name> lport rhost rport\n\n" +
 
-                "Description\n\n\t" +
+                        "Description\n\n\t" +
 
-                "A port forwarder is a program which lives between client\n\t" +
-                "connecting to some internet service and the service itself.\n\t" +
-                "It takes incoming bytes on from local tcp connection and\n\t" +
-                "forwards them to the requested service connection pretending\n\t" +
-                "the client\n\n" +
+                        "A port forwarder is a program which lives between client\n\t" +
+                        "connecting to some internet service and the service itself.\n\t" +
+                        "It takes incoming bytes on from local tcp connection and\n\t" +
+                        "forwards them to the requested service connection pretending\n\t" +
+                        "the client\n\n" +
 
-                "Arguments\n\n\t" +
+                        "Arguments\n\n\t" +
 
-                "lport - the port on which the forwarder works.\n\t" +
-                "It is a port which the client passes to address line \n\t" +
-                "(e.g. 'http://google.com:12345', the lport is 12345)\n\n\t" +
+                        "lport - the port on which the forwarder works.\n\t" +
+                        "It is a port which the client passes to address line \n\t" +
+                        "(e.g. 'http://google.com:12345', the lport is 12345)\n\n\t" +
 
-                "rhost and rport together describe the requested service.\n\n");
+                        "rhost and rport together describe the requested service.\n\n");
     }
 
     private static final int REQUIRED_NUMBER_OF_ARGUMENTS = 3;
@@ -150,14 +150,12 @@ public class PortForwarder {
     }
 
     private boolean hostEntryAdded = false;
-    private String hostEntry = null;
     private static final String HOSTS_FILE_NAME = "/etc/hosts";
-    private static final String HOSTS_TMP_FILE_NAME = "hosts.tmp";
     private static final Path HOSTS_FILE_PATH = Paths.get(HOSTS_FILE_NAME);
     private Path hostsTmpPath;
 
     private void addHostEntry() {
-        hostEntry = "127.0.0.1 " + rhost;
+        String hostEntry = "127.0.0.1 " + rhost;
         try {
             File tmp = File.createTempFile(HOSTS_FILE_NAME, ".tmp");
             hostsTmpPath = tmp.toPath();
@@ -167,11 +165,12 @@ public class PortForwarder {
             return;
         }
 
-        try (FileWriter fileWriter = new FileWriter("/etc/hosts", true)) {
-            System.out.format("Appending '%s' to /etc/hosts...\n", hostEntry);
+        try (FileWriter fileWriter = new FileWriter(HOSTS_FILE_NAME, true)) {
+            System.out.format("Appending '%s' to %s...\t", hostEntry, HOSTS_FILE_NAME);
             BufferedWriter writer = new BufferedWriter(fileWriter);
             writer.write(hostEntry + System.lineSeparator());
             writer.close();
+            System.out.println("done.");
             hostEntryAdded = true;
         } catch (IOException e) {
             System.err.format("Warning: Couldn't add host entry '%s': %s\n", hostEntry, e.getMessage());
@@ -189,7 +188,7 @@ public class PortForwarder {
 
         try {
             Files.copy(hostsTmpPath, HOSTS_FILE_PATH, StandardCopyOption.REPLACE_EXISTING);
-            Files.deleteIfExists(Paths.get("/tmp/etc/hosts"));
+            Files.deleteIfExists(hostsTmpPath);
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -209,7 +208,6 @@ public class PortForwarder {
             while (keyIter.hasNext()) {
                 SelectionKey key = keyIter.next();
                 if (!key.isValid()) {
-                    keyIter.remove();
                     continue;
                 }
                 try {
@@ -221,6 +219,7 @@ public class PortForwarder {
                         continue;
                     } else if (key.isConnectable()) {
                         System.out.println("\tis connectable");
+                        connect((ChannelPair) key.attachment());
                         continue;
                     }
 
@@ -230,6 +229,7 @@ public class PortForwarder {
                         int bytesRead = forwardUnit.read();
                         if (bytesRead < 0) {
                             // eof
+                            // TODO: 12/11/17 fix close
                             forwardUnit.in.close();
                             forwardUnit.out.close();
                             continue;
@@ -258,6 +258,7 @@ public class PortForwarder {
             localChannel = serverSocketChannel.accept();
             localChannel.configureBlocking(false);
             System.out.println("\taccepted " + localChannel);
+            localChannel.register(selector, SelectionKey.OP_READ, new ForwardUnit(localChannel, null, BUFF_SIZE));
         } catch (SocketTimeoutException e) {
             throw e;
         } catch (IOException e) {
@@ -270,9 +271,9 @@ public class PortForwarder {
 
         try {
             remoteChannel = SocketChannel.open();
-            remoteChannel.connect(remoteSocketAddress);
             remoteChannel.configureBlocking(false);
-            System.out.println("\tconnected " + remoteChannel);
+            remoteChannel.connect(remoteSocketAddress);
+            remoteChannel.register(selector, SelectionKey.OP_CONNECT, new ChannelPair(localChannel, remoteChannel));
         } catch (IOException e) {
             e.printStackTrace();
             try {
@@ -287,15 +288,47 @@ public class PortForwarder {
             throw e;
         }
 
+
+    }
+
+    private void connect(ChannelPair channelPair) throws IOException {
         try {
-            ForwardUnit l2r = new ForwardUnit(localChannel, remoteChannel, BUFF_SIZE);
-            ForwardUnit r2l = new ForwardUnit(remoteChannel, localChannel, BUFF_SIZE);
-            localChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, l2r);
-            remoteChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, r2l);
+            boolean connected = channelPair.remote.finishConnect();
+            if (connected) {
+                System.out.println("\tconnected " + channelPair.remote);
+            } else {
+                System.err.println("\t" + channelPair.remote + " not connected :(");
+                return;
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+            try {
+                channelPair.remote.close();
+            } catch (IOException e1) {
+                e1.printStackTrace();
+            }
+            throw e;
+        }
+
+        try {
+            ForwardUnit l2r = new ForwardUnit(channelPair.local, channelPair.remote, BUFF_SIZE);
+            ForwardUnit r2l = new ForwardUnit(channelPair.remote, channelPair.local, BUFF_SIZE);
+            channelPair.local.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, l2r);
+            channelPair.remote.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, r2l);
         } catch (IOException e) {
             e.printStackTrace();
             throw e;
             // TODO: 12/10/17 correctly handle exception
+        }
+    }
+
+    private static class ChannelPair {
+        private final SocketChannel local;
+        private final SocketChannel remote;
+
+        private ChannelPair(SocketChannel local, SocketChannel remote) {
+            this.local = local;
+            this.remote = remote;
         }
     }
 
