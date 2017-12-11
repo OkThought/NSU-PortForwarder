@@ -4,6 +4,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
+import java.nio.file.*;
 import java.util.Iterator;
 
 public class PortForwarder {
@@ -150,11 +151,27 @@ public class PortForwarder {
 
     private boolean hostEntryAdded = false;
     private String hostEntry = null;
+    private static final String HOSTS_FILE_NAME = "/etc/hosts";
+    private static final String HOSTS_TMP_FILE_NAME = "hosts.tmp";
+    private static final Path HOSTS_FILE_PATH = Paths.get(HOSTS_FILE_NAME);
+    private Path hostsTmpPath;
+
     private void addHostEntry() {
         hostEntry = "127.0.0.1 " + rhost;
+        try {
+            File tmp = File.createTempFile(HOSTS_FILE_NAME, ".tmp");
+            hostsTmpPath = tmp.toPath();
+            Files.copy(HOSTS_FILE_PATH, hostsTmpPath, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return;
+        }
+
         try (FileWriter fileWriter = new FileWriter("/etc/hosts", true)) {
+            System.out.format("Appending '%s' to /etc/hosts...\n", hostEntry);
             BufferedWriter writer = new BufferedWriter(fileWriter);
-            writer.write(hostEntry);
+            writer.write(hostEntry + System.lineSeparator());
+            writer.close();
             hostEntryAdded = true;
         } catch (IOException e) {
             System.err.format("Warning: Couldn't add host entry '%s': %s\n", hostEntry, e.getMessage());
@@ -170,22 +187,9 @@ public class PortForwarder {
     private void removeHostEntry() {
         if (!hostEntryAdded) return;
 
-        try (FileWriter fileWriter = new FileWriter("/etc/hosts", false)) {
-            BufferedReader reader = new BufferedReader(new FileReader("/etc/hosts"));
-            BufferedWriter writer = new BufferedWriter(fileWriter);
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.trim().equals(hostEntry)) {
-                    hostEntryAdded = false;
-                    continue;
-                }
-                writer.write(line);
-            }
-
-            if (hostEntryAdded) {
-                System.err.format("Couldn't find and remove host entry '%s': was it you?!\n", hostEntry);
-            }
-
+        try {
+            Files.copy(hostsTmpPath, HOSTS_FILE_PATH, StandardCopyOption.REPLACE_EXISTING);
+            Files.deleteIfExists(Paths.get("/tmp/etc/hosts"));
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -265,7 +269,6 @@ public class PortForwarder {
         SocketChannel remoteChannel = null;
 
         try {
-//            System.out.println("\tconnecting it to remote: " + remoteSocketAddress);
             remoteChannel = SocketChannel.open();
             remoteChannel.connect(remoteSocketAddress);
             remoteChannel.configureBlocking(false);
