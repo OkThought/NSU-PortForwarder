@@ -7,6 +7,8 @@ import java.nio.channels.*;
 import java.nio.file.*;
 import java.util.Iterator;
 
+import static java.nio.channels.SelectionKey.*;
+
 public class PortForwarder {
     private static void usage() {
         System.out.print(
@@ -124,7 +126,7 @@ public class PortForwarder {
             System.out.println("Starting Port Forwarder...");
             serverSocketChannel.configureBlocking(false);
             serverSocketChannel.bind(localSocketAddress);
-            serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT, serverSocketChannel);
+            serverSocketChannel.register(selector, OP_ACCEPT, serverSocketChannel);
             System.out.format("Started Port Forwarder:\n\t" +
                     "local: %s\n\tremote: %s\n\n", serverSocketChannel.getLocalAddress(), remoteSocketAddress);
         } catch (IOException e) {
@@ -196,52 +198,49 @@ public class PortForwarder {
 
     private void loop() throws IOException {
         while (!Thread.interrupted()) {
-            int numberReady = 0;
+            int numberReady = selector.select();
             while (numberReady <= 0) {
+                System.out.println("select returned " + numberReady);
                 numberReady = selector.select();
             }
 
-            System.out.println(numberReady + " channels are ready");
-            System.out.println("processing them...\n");
-            int cnt = 0;
+            System.out.println();
+            System.out.println(numberReady + " channels are ready\n");
             Iterator<SelectionKey> keyIter = selector.selectedKeys().iterator();
+            int cnt = 0;
             while (keyIter.hasNext()) {
                 SelectionKey key = keyIter.next();
                 if (!key.isValid()) {
                     continue;
                 }
+
                 try {
                     System.out.format("%d. %s\n", ++cnt, key.channel());
 
                     if (key.isAcceptable()) {
-                        System.out.println("\tis acceptable");
-                        acceptNewConnection();
+                        System.out.print("\tACCEPT\t");
+                        accept();
                         continue;
                     } else if (key.isConnectable()) {
-                        System.out.println("\tis connectable");
+                        System.out.print("\tCONNECT\t");
                         connect((ChannelPair) key.attachment());
                         continue;
                     }
 
                     if (key.isReadable()) {
-                        System.out.println("\tis readable");
-                        ForwardUnit forwardUnit = (ForwardUnit) key.attachment();
-                        int bytesRead = forwardUnit.read();
-                        if (bytesRead < 0) {
-                            // eof
-                            // TODO: 12/11/17 fix close
-                            forwardUnit.in.close();
-                            forwardUnit.out.close();
-                            continue;
-                        }
-                        System.out.format("\tbytes read: %d\n", bytesRead);
+                        System.out.print("\tREAD\t");
+                        ChannelPair pair = (ChannelPair) key.attachment();
+
+                        int bytesRead = pair.read(key.channel() == pair.local);
+                        System.out.format("bytes read: %d\n", bytesRead);
+                        if (bytesRead == -1) continue;
                     }
 
                     if (key.isWritable()) {
-                        System.out.println("\tis writable");
-                        ForwardUnit forwardUnit = (ForwardUnit) key.attachment();
-                        int bytesWritten = forwardUnit.write();
-                        System.out.format("\tbytes written: %d\n", bytesWritten);
+                        System.out.println("\tWRITE\t");
+                        ChannelPair pair = (ChannelPair) key.attachment();
+                        int bytesWritten = pair.write(key.channel() == pair.remote);
+                        System.out.format("bytes written: %d\n", bytesWritten);
                     }
                 } finally {
                     keyIter.remove();
@@ -252,34 +251,29 @@ public class PortForwarder {
         }
     }
 
-    private void acceptNewConnection() throws IOException {
-        SocketChannel localChannel;
-        try {
-            localChannel = serverSocketChannel.accept();
-            localChannel.configureBlocking(false);
-            System.out.println("\taccepted " + localChannel);
-            localChannel.register(selector, SelectionKey.OP_READ, new ForwardUnit(localChannel, null, BUFF_SIZE));
-        } catch (SocketTimeoutException e) {
-            throw e;
-        } catch (IOException e) {
-            e.printStackTrace();
-            // TODO: 12/10/17 correctly handle exception
-            throw e;
-        }
-
-        SocketChannel remoteChannel = null;
+    private void accept() throws IOException {
+        ChannelPair pair = new ChannelPair(BUFF_SIZE);
 
         try {
-            remoteChannel = SocketChannel.open();
-            remoteChannel.configureBlocking(false);
-            remoteChannel.connect(remoteSocketAddress);
-            remoteChannel.register(selector, SelectionKey.OP_CONNECT, new ChannelPair(localChannel, remoteChannel));
+            pair.local = serverSocketChannel.accept();
+            pair.local.configureBlocking(false);
+            System.out.println("accepted " + pair.local);
+            pair.local.register(selector, OP_READ, pair);
+
+            pair.remote = SocketChannel.open();
+            pair.remote.configureBlocking(false);
+            pair.remote.connect(remoteSocketAddress);
+
+            pair.remote.register(selector, OP_CONNECT, pair);
         } catch (IOException e) {
             e.printStackTrace();
             try {
-                localChannel.close();
-                if (remoteChannel != null) {
-                    remoteChannel.close();
+                if (pair.local != null) {
+                    pair.local.close();
+                }
+
+                if (pair.remote != null) {
+                    pair.remote.close();
                 }
             } catch (IOException e1) {
                 e1.printStackTrace();
@@ -291,70 +285,90 @@ public class PortForwarder {
 
     }
 
-    private void connect(ChannelPair channelPair) throws IOException {
+    private void connect(ChannelPair pair) throws IOException {
+        boolean connected;
         try {
-            boolean connected = channelPair.remote.finishConnect();
-            if (connected) {
-                System.out.println("\tconnected " + channelPair.remote);
-            } else {
-                System.err.println("\t" + channelPair.remote + " not connected :(");
-                return;
-            }
+            connected = pair.remote.finishConnect();
         } catch (IOException e) {
             e.printStackTrace();
             try {
-                channelPair.remote.close();
+                pair.remote.close();
+                pair.local.close();
             } catch (IOException e1) {
                 e1.printStackTrace();
             }
             throw e;
         }
 
-        try {
-            ForwardUnit l2r = new ForwardUnit(channelPair.local, channelPair.remote, BUFF_SIZE);
-            ForwardUnit r2l = new ForwardUnit(channelPair.remote, channelPair.local, BUFF_SIZE);
-            channelPair.local.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, l2r);
-            channelPair.remote.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, r2l);
-        } catch (IOException e) {
-            e.printStackTrace();
-            throw e;
-            // TODO: 12/10/17 correctly handle exception
+        if (connected) {
+            System.out.println("connected " + pair.remote);
+            pair.remote.keyFor(selector).interestOps(OP_READ | OP_WRITE);
+        } else {
+            System.err.println("connect not finished");
         }
     }
 
-    private static class ChannelPair {
-        private final SocketChannel local;
-        private final SocketChannel remote;
+    private void addOps(SelectionKey key, int ops) {
+        key.interestOps(key.interestOps() | ops);
+    }
 
-        private ChannelPair(SocketChannel local, SocketChannel remote) {
+    private void removeOps(SelectionKey key, int ops) {
+        key.interestOps(key.interestOps() & (~ops));
+    }
+
+    private class ChannelPair {
+        private SocketChannel local;
+        private SocketChannel remote;
+        private ByteBuffer forwardBuffer;
+        private ByteBuffer backwardBuffer;
+
+        private ChannelPair(int bufferSize) {
+            this(null, null, bufferSize);
+        }
+
+        private ChannelPair(SocketChannel local, SocketChannel remote, int bufferSize) {
             this.local = local;
             this.remote = remote;
-        }
-    }
-
-    private static class ForwardUnit {
-        private final SocketChannel in;
-        private final SocketChannel out;
-        private final ByteBuffer buffer;
-        private boolean lastOperationWasRead = true;
-
-        private ForwardUnit(SocketChannel in, SocketChannel out, int bufferSize) {
-            this.in = in;
-            this.out = out;
-            this.buffer = ByteBuffer.allocate(bufferSize);
+            this.forwardBuffer = ByteBuffer.allocate(bufferSize);
+            this.backwardBuffer = ByteBuffer.allocate(bufferSize);
         }
 
-        private int read() throws IOException {
-            if (!lastOperationWasRead) buffer.compact();
+        private int read(boolean forward) throws IOException {
+            SocketChannel in = forward ? local : remote;
+            SocketChannel out = forward ? remote : local;
+            ByteBuffer buffer = forward ? forwardBuffer : backwardBuffer;
             int bytesRead = in.read(buffer);
-            lastOperationWasRead = true;
+            if (bytesRead > 0 && out != null) {
+                addOps(out.keyFor(selector), OP_WRITE);
+            }
+
+            if (bytesRead == -1) {
+                // eof
+                if (out.isOpen()) {
+                    out.shutdownInput();
+                }
+                in.keyFor(selector).cancel();
+                in.close();
+            }
             return bytesRead;
         }
 
-        private int write() throws IOException {
-            if (lastOperationWasRead) buffer.flip();
+        private int write(boolean forward) throws IOException {
+            SocketChannel out = forward ? remote : local;
+            ByteBuffer buffer = forward ? forwardBuffer : backwardBuffer;
+
+            buffer.flip();
+
             int bytesWritten = out.write(buffer);
-            lastOperationWasRead = false;
+
+            if (!buffer.hasRemaining()) {
+                removeOps(out.keyFor(selector), OP_WRITE);
+            }
+
+            if (bytesWritten > 0) {
+                buffer.compact();
+            }
+
             return bytesWritten;
         }
     }
