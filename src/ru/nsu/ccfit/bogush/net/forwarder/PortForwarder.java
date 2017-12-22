@@ -96,7 +96,6 @@ public class PortForwarder {
         portForwarder.start();
     }
     private final Selector selector;
-    private final ServerSocketChannel serverSocketChannel;
     private final InetSocketAddress localSocketAddress;
     private final InetSocketAddress remoteSocketAddress;
     private final String rhost;
@@ -108,7 +107,6 @@ public class PortForwarder {
                 "rport: %s\n\n", lport, rhost, rport);
 
         selector = Selector.open();
-        serverSocketChannel = ServerSocketChannel.open();
         localSocketAddress = new InetSocketAddress(lport);
         remoteSocketAddress = new InetSocketAddress(rhost, rport);
         this.rhost = rhost.getHostName();
@@ -124,6 +122,7 @@ public class PortForwarder {
     private void start() {
         try {
             System.out.println("Starting Port Forwarder...");
+            ServerSocketChannel serverSocketChannel = ServerSocketChannel.open();
             serverSocketChannel.configureBlocking(false);
             serverSocketChannel.bind(localSocketAddress);
             serverSocketChannel.register(selector, OP_ACCEPT, serverSocketChannel);
@@ -430,7 +429,7 @@ public class PortForwarder {
 
         private void close()
                 throws IOException {
-            System.out.format("%-9s %s", "CLOSE", PortForwarder.toString(socket));
+            System.out.format("%-9s %s\n", "CLOSE", PortForwarder.toString(socket));
             socket.close();
             socket.keyFor(selector).cancel();
         }
