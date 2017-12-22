@@ -38,6 +38,8 @@ public class PortForwarder {
     private static final int RHOST_ARGUMENT_INDEX = 1;
     private static final int RPORT_ARGUMENT_INDEX = 2;
     private static final int EXIT_FAILURE = 1;
+    private static final int BUFF_SIZE = 8 << 10; // 8 kilobytes
+
 
     public static void main(String[] args) {
         if (args.length != REQUIRED_NUMBER_OF_ARGUMENTS) {
@@ -93,13 +95,11 @@ public class PortForwarder {
 
         portForwarder.start();
     }
-
     private final Selector selector;
     private final ServerSocketChannel serverSocketChannel;
     private final InetSocketAddress localSocketAddress;
     private final InetSocketAddress remoteSocketAddress;
     private final String rhost;
-    private static final int BUFF_SIZE = 1 << 20; // 1 megabyte
 
     private PortForwarder(int lport, InetAddress rhost, int rport) throws IOException {
         System.out.format("Configure Port Forwarder with params:\n\t" +
@@ -144,6 +144,7 @@ public class PortForwarder {
         addHostEntry();
 
         try {
+            System.out.println("Start main loop\n\n");
             loop();
         } catch (IOException e) {
             System.err.println("Loop failed :(");
@@ -200,86 +201,70 @@ public class PortForwarder {
         while (!Thread.interrupted()) {
             int numberReady = selector.select();
             while (numberReady <= 0) {
-//                System.out.println("select returned " + numberReady);
-//                System.out.println(selector.selectedKeys().size() + " keys are selected");
-//                try {
-//                    Thread.sleep(200);
-//                } catch (InterruptedException e) {
-//                    e.printStackTrace();
-//                }
                 numberReady = selector.select();
             }
 
-            Iterator<SelectionKey> keyIter = selector.selectedKeys().iterator();
-            while (keyIter.hasNext()) {
-                SelectionKey key = keyIter.next();
+            Iterator<SelectionKey> iterator = selector.selectedKeys().iterator();
+            while (iterator.hasNext()) {
+                SelectionKey key = iterator.next();
                 if (!key.isValid()) {
-                    keyIter.remove();
+                    iterator.remove();
                     continue;
                 }
 
                 try {
                     if (key.isAcceptable()) {
-                        ChannelPair pair = accept();
-                        System.out.format("ACCEPT\t%s\n", toString(pair.local));
-                    } else if (key.isConnectable()) {
-                        ChannelPair pair = (ChannelPair) key.attachment();
-                        connect(pair);
-                        System.out.format("CONNECT\t%s\n", toString(pair.remote));
+                        accept(key);
+                        continue;
+                    }
+
+                    if (key.isConnectable()) {
+                        connect(key);
                         continue;
                     }
 
                     if (key.isReadable()) {
-                        System.out.format("READ from\t%s: ", toString(((SocketChannel) key.channel()).getRemoteAddress()));
-                        ChannelPair pair = (ChannelPair) key.attachment();
-                        boolean straight = key.channel() == pair.local;
-                        int bytesRead = pair.read(straight);
-//                        System.out.format("READ from %s: %d bytes\n",
-//                                straight ? toString(pair.local) : toString(pair.remote), bytesRead);
-                        System.out.format("%d bytes\n", bytesRead);
+                        int bytesRead = read(key);
                         if (bytesRead == -1) continue;
                     }
 
                     if (key.isWritable()) {
-                        System.out.format("WRITE to\t%s: ", toString(((SocketChannel) key.channel()).getRemoteAddress()));
-                        ChannelPair pair = (ChannelPair) key.attachment();
-                        boolean straight = key.channel() == pair.remote;
-                        int bytesWritten = pair.write(straight);
-//                        System.out.format("WRITE to %s: %d bytes\n",
-//                                straight ? toString(pair.remote) : toString(pair.local), bytesWritten);
-                        System.out.format("%d bytes\n", bytesWritten);
+                        write(key);
                     }
+                } catch (IOException e) {
+                    e.printStackTrace();
                 } finally {
-                    keyIter.remove();
-//                    System.out.println();
+                    iterator.remove();
                 }
             }
         }
     }
 
-    private ChannelPair accept() throws IOException {
-        ChannelPair pair = new ChannelPair(BUFF_SIZE);
-
+    private void accept(SelectionKey key) throws IOException {
+        ForwardUnit unit = new ForwardUnit(BUFF_SIZE);
+        ForwardUnit opp = null;
+        ServerSocketChannel serverSocketChannel = (ServerSocketChannel) key.channel();
         try {
-            pair.local = serverSocketChannel.accept();
-            pair.local.configureBlocking(false);
-//            System.out.println("accepted " + toString(pair.local));
-            pair.local.register(selector, OP_READ, pair);
-
-            pair.remote = SocketChannel.open();
-            pair.remote.configureBlocking(false);
-            pair.remote.connect(remoteSocketAddress);
-
-            pair.remote.register(selector, OP_CONNECT, pair);
+            unit.socket = serverSocketChannel.accept();
+            System.out.format("%-9s %s\n", "ACCEPT", unit);
+            unit.socket.configureBlocking(false);
+            opp = new ForwardUnit(unit.socket, BUFF_SIZE);
+            opp.socket = SocketChannel.open();
+            opp.socket.configureBlocking(false);
+            opp.socket.connect(remoteSocketAddress);
+            opp.opposite = unit;
+            unit.opposite = opp;
+            unit.socket.register(selector, OP_READ, unit);
+            opp.socket.register(selector, OP_CONNECT, opp);
         } catch (IOException e) {
             e.printStackTrace();
             try {
-                if (pair.local != null) {
-                    pair.local.close();
+                if (unit.socket != null) {
+                    unit.socket.close();
                 }
 
-                if (pair.remote != null) {
-                    pair.remote.close();
+                if (opp != null && opp.socket != null) {
+                    opp.socket.close();
                 }
             } catch (IOException e1) {
                 e1.printStackTrace();
@@ -287,32 +272,48 @@ public class PortForwarder {
             // TODO: 12/10/17 correctly handle exception
             throw e;
         }
-
-        return pair;
     }
 
-    private void connect(ChannelPair pair) throws IOException {
+    private void connect(SelectionKey key) throws IOException {
+        ForwardUnit unit = (ForwardUnit) key.attachment();
         boolean connected;
         try {
-            connected = pair.remote.finishConnect();
+            connected = unit.socket.finishConnect();
         } catch (IOException e) {
             e.printStackTrace();
             try {
-                pair.remote.close();
-                pair.local.close();
+                unit.opposite.socket.close();
+                unit.socket.close();
             } catch (IOException e1) {
                 e1.printStackTrace();
             }
             throw e;
         }
 
+        System.out.format("%-9s %s\n", "CONNECT", unit);
         if (connected) {
 //            System.out.println("connected " + toString(pair.remote));
-            addOps(pair.remote.keyFor(selector), OP_READ);
+            removeOps(unit.socket.keyFor(selector), OP_CONNECT);
+            addOps(unit.socket.keyFor(selector), OP_READ | OP_WRITE);
         } else {
 //            System.err.println("connect not finished");
         }
     }
+
+    private int write(SelectionKey key)
+            throws IOException {
+        ForwardUnit unit = (ForwardUnit) key.attachment();
+        System.out.format("%-9s %s: ", "WRITE to", toString(unit.socket));
+        return unit.write();
+    }
+
+    private int read(SelectionKey key)
+            throws IOException {
+        ForwardUnit unit = (ForwardUnit) key.attachment();
+        System.out.format("%-9s %s: ", "READ from", toString(unit.socket));
+        return unit.read();
+    }
+
 
     private void addOps(SelectionKey key, int ops) {
         key.interestOps(key.interestOps() | ops);
@@ -327,7 +328,7 @@ public class PortForwarder {
         InetSocketAddress addr = (InetSocketAddress) address;
         String ip = addr.getAddress().getHostAddress();
         int port = addr.getPort();
-        return String.format("%s:%d", ip, port);
+        return String.format("%15s:%-5d", ip, port);
     }
 
     private static String toString(SelectableChannel s) {
@@ -348,66 +349,95 @@ public class PortForwarder {
                 channel.isConnected() ? "connected" : channel.isConnectionPending() ? "connection pending" : "disconnected");
     }
 
-    private class ChannelPair {
-        private SocketChannel local;
-        private SocketChannel remote;
-        private ByteBuffer straightBuffer;
-        private ByteBuffer reverseBuffer;
+    private class ForwardUnit {
+        private SocketChannel socket;
+        private ForwardUnit opposite;
+        private boolean eof = false;
+        private boolean outputIsShutdown = false;
+        private ByteBuffer buf;
 
-        private ChannelPair(int bufferSize) {
-            this(null, null, bufferSize);
+        private ForwardUnit(int bufferSize) {
+            this(null, bufferSize);
         }
 
-        private ChannelPair(SocketChannel local, SocketChannel remote, int bufferSize) {
-            this.local = local;
-            this.remote = remote;
-            this.straightBuffer = ByteBuffer.allocate(bufferSize);
-            this.reverseBuffer = ByteBuffer.allocate(bufferSize);
+        private ForwardUnit(SocketChannel socket, int bufferSize) {
+            this.socket = socket;
+            this.buf = ByteBuffer.allocate(bufferSize);
         }
 
-        private int read(boolean straight) throws IOException {
-            SocketChannel in = straight ? local : remote;
-            SocketChannel out = straight ? remote : local;
-            ByteBuffer buffer = straight ? straightBuffer : reverseBuffer;
-            int bytesRead = in.read(buffer);
-            if (bytesRead > 0 && out != null) {
-                addOps(out.keyFor(selector), OP_WRITE);
+        private int read() throws IOException {
+            int bytesRead = socket.read(buf);
+
+            System.out.format("%d bytes\n", bytesRead);
+
+            if (bytesRead > 0 && opposite.socket.isConnected()) {
+                addOps(opposite.socket.keyFor(selector), OP_WRITE);
             }
 
             if (bytesRead == -1) {
                 // eof
-                if (out.isOpen()) {
-                    out.shutdownInput();
+                eof = true;
+                removeOps(socket.keyFor(selector), OP_READ);
+
+                if (buf.position() == 0) {
+                    opposite.shutdownOutput();
+                    if (outputIsShutdown || opposite.buf.position() == 0) {
+                        close();
+                        opposite.close();
+                    }
                 }
-                in.keyFor(selector).cancel();
-                in.close();
+
+            }
+
+            if (!buf.hasRemaining()) {
+                removeOps(socket.keyFor(selector), OP_READ);
             }
             return bytesRead;
         }
 
-        private int write(boolean straight) throws IOException {
-            SocketChannel out = straight ? remote : local;
-            ByteBuffer buffer = straight ? straightBuffer : reverseBuffer;
+        private int write() throws IOException {
+            opposite.buf.flip();
 
-            buffer.flip();
-
-            int bytesWritten = out.write(buffer);
-
-            if (!buffer.hasRemaining()) {
-                removeOps(out.keyFor(selector), OP_WRITE);
-            }
+            int bytesWritten = socket.write(opposite.buf);
 
             if (bytesWritten > 0) {
-                buffer.compact();
+                opposite.buf.compact();
+                addOps(opposite.socket.keyFor(selector), OP_READ);
+            }
+
+            System.out.format("%d bytes\n", bytesWritten);
+
+            if (opposite.buf.position() == 0) {
+                // wrote everything from opposite.buf
+                removeOps(socket.keyFor(selector), OP_WRITE);
+                if (opposite.eof) {
+                    shutdownOutput();
+                    if (opposite.outputIsShutdown) {
+                        close();
+                        opposite.close();
+                    }
+                }
             }
 
             return bytesWritten;
         }
 
+        private void shutdownOutput()
+                throws IOException {
+            socket.shutdownOutput();
+            outputIsShutdown = true;
+        }
+
+        private void close()
+                throws IOException {
+            System.out.format("%-9s %s", "CLOSE", PortForwarder.toString(socket));
+            socket.close();
+            socket.keyFor(selector).cancel();
+        }
+
         @Override
         public String toString() {
-            return String.format("ChannelPair{local: %s remote: %s}",
-                    PortForwarder.toString(local), PortForwarder.toString(remote));
+            return PortForwarder.toString(socket);
         }
     }
 }
